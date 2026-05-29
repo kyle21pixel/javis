@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.env
+agent/javis.db
+
+# Node / React
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.env.local
+
+# C build outputs
+core/*.dll
+core/*.so
+core/*.exe
+core/*.a
+core/*.o
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,9 @@
+# J.A.V.I.S. Python Dependencies
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-dotenv==1.0.1
+google-generativeai==0.7.2
+twilio==9.0.5
+africastalking==1.2.5
+pydantic==2.7.1
+httpx==0.27.0
