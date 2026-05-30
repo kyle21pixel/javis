@@ -16,7 +16,8 @@ from config import (
     EMAIL_ADDRESS, EMAIL_PASSWORD,
     IMAP_HOST, IMAP_PORT,
     SMTP_HOST, SMTP_PORT,
-    EMAIL_POLL_SECS, AUTO_SEND_REPLIES
+    EMAIL_POLL_SECS, AUTO_SEND_REPLIES,
+    SEND_RETRY_COUNT, SEND_RETRY_BACKOFF,
 )
 
 
@@ -32,27 +33,30 @@ def _decode_header_value(value: str) -> str:
 
 
 def send_email(to_addr: str, subject: str, body: str) -> bool:
-    """Send an email reply via SMTP."""
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["From"]    = EMAIL_ADDRESS
-        msg["To"]      = to_addr
-        msg["Subject"] = f"Re: {subject}" if not subject.startswith("Re:") else subject
-        msg.attach(MIMEText(body, "plain"))
+    """Send an email reply via SMTP with retry support."""
+    for attempt in range(1, SEND_RETRY_COUNT + 1):
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["From"]    = EMAIL_ADDRESS
+            msg["To"]      = to_addr
+            msg["Subject"] = f"Re: {subject}" if not subject.startswith("Re:") else subject
+            msg.attach(MIMEText(body, "plain"))
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_ADDRESS, to_addr, msg.as_string())
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+                server.ehlo()
+                server.starttls()
+                server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+                server.sendmail(EMAIL_ADDRESS, to_addr, msg.as_string())
 
-        print(f"[JAVIS-Email] ✉ Sent reply to {to_addr}")
-        database.log_event("email_sent", f"To: {to_addr} | Subject: {subject}")
-        return True
-    except Exception as e:
-        print(f"[JAVIS-Email] Send error: {e}")
-        database.log_event("email_error", str(e))
-        return False
+            print(f"[JAVIS-Email] ✉ Sent reply to {to_addr}")
+            database.log_event("email_sent", f"To: {to_addr} | Subject: {subject}")
+            return True
+        except Exception as e:
+            print(f"[JAVIS-Email] Send error (attempt {attempt}/{SEND_RETRY_COUNT}): {e}")
+            database.log_event("email_error", f"Attempt {attempt}: {e}")
+            if attempt < SEND_RETRY_COUNT:
+                time.sleep(SEND_RETRY_BACKOFF ** (attempt - 1))
+    return False
 
 
 def _process_email(mail_msg) -> None:

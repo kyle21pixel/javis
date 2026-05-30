@@ -1,178 +1,295 @@
 """
-J.A.V.I.S. Database — SQLite storage for messages, conversations, contacts, logs
+J.A.V.I.S. Database — SQLAlchemy storage for messages, conversations, contacts, logs, and users.
 """
-import sqlite3
 import datetime
-from config import DATABASE_PATH
+import json
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    Text,
+    DateTime,
+    ForeignKey,
+    func,
+)
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+
+from config import DATABASE_URL, ENABLE_REDIS_CACHE, DEFAULT_ADMIN_USER, DEFAULT_ADMIN_PASSWORD
+from redis_client import redis_client
+from hash_utils import get_password_hash
+
+Base = declarative_base()
+_engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+    future=True,
+)
+SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False, future=True)
 
 
-def get_conn():
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+class Contact(Base):
+    __tablename__ = "contacts"
+    id = Column(Integer, primary_key=True, index=True)
+    identifier = Column(String, unique=True, nullable=False, index=True)
+    name = Column(String, default="")
+    channel = Column(String, default="email")
+    first_seen = Column(DateTime)
+    last_seen = Column(DateTime)
+    total_msgs = Column(Integer, default=0)
+    conversations = relationship("Conversation", back_populates="contact")
+
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+    id = Column(Integer, primary_key=True, index=True)
+    contact_id = Column(Integer, ForeignKey("contacts.id"), nullable=False, index=True)
+    subject = Column(String, default="")
+    status = Column(String, default="open")
+    created_at = Column(DateTime)
+    updated_at = Column(DateTime)
+    contact = relationship("Contact", back_populates="conversations")
+    messages = relationship("Message", back_populates="conversation")
+
+
+class Message(Base):
+    __tablename__ = "messages"
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False, index=True)
+    direction = Column(String, nullable=False)
+    body = Column(Text, nullable=False)
+    ai_draft = Column(Text, default="")
+    status = Column(String, default="pending")
+    created_at = Column(DateTime)
+    conversation = relationship("Conversation", back_populates="messages")
+
+
+class ActivityLog(Base):
+    __tablename__ = "activity_log"
+    id = Column(Integer, primary_key=True, index=True)
+    event = Column(String, nullable=False)
+    detail = Column(Text, default="")
+    user = Column(String, default="")
+    created_at = Column(DateTime)
+
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    role = Column(String, default="operator")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
 def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.executescript("""
-        CREATE TABLE IF NOT EXISTS contacts (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            identifier  TEXT UNIQUE NOT NULL,   -- email addr or phone number
-            name        TEXT DEFAULT '',
-            channel     TEXT DEFAULT 'email',   -- 'email' | 'sms'
-            first_seen  TEXT,
-            last_seen   TEXT,
-            total_msgs  INTEGER DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS conversations (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            contact_id  INTEGER NOT NULL,
-            subject     TEXT DEFAULT '',
-            status      TEXT DEFAULT 'open',    -- 'open' | 'resolved'
-            created_at  TEXT,
-            updated_at  TEXT,
-            FOREIGN KEY (contact_id) REFERENCES contacts(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS messages (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id INTEGER NOT NULL,
-            direction       TEXT NOT NULL,      -- 'inbound' | 'outbound'
-            body            TEXT NOT NULL,
-            ai_draft        TEXT DEFAULT '',    -- AI-generated reply draft
-            status          TEXT DEFAULT 'pending',  -- 'pending'|'approved'|'sent'|'auto_sent'
-            created_at      TEXT,
-            FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS activity_log (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            event       TEXT NOT NULL,
-            detail      TEXT DEFAULT '',
-            created_at  TEXT
-        );
-    """)
-
-    conn.commit()
-    conn.close()
-    print("[JAVIS-DB] Database initialised:", DATABASE_PATH)
+    Base.metadata.create_all(bind=_engine)
+    with SessionLocal() as session:
+        if not session.query(User).filter(User.username == DEFAULT_ADMIN_USER).first():
+            default_user = User(
+                username=DEFAULT_ADMIN_USER,
+                hashed_password=get_password_hash(DEFAULT_ADMIN_PASSWORD),
+                role="admin",
+            )
+            session.add(default_user)
+            session.commit()
+            print(f"[JAVIS-DB] Default admin user created: {DEFAULT_ADMIN_USER}")
+    print("[JAVIS-DB] Database initialised:", DATABASE_URL)
 
 
-def log_event(event: str, detail: str = ""):
-    conn = get_conn()
-    conn.execute(
-        "INSERT INTO activity_log (event, detail, created_at) VALUES (?, ?, ?)",
-        (event, detail, datetime.datetime.utcnow().isoformat())
-    )
-    conn.commit()
-    conn.close()
+def get_session():
+    return SessionLocal()
+
+
+def log_event(event: str, detail: str = "", user: str = ""):
+    with get_session() as session:
+        session.add(ActivityLog(event=event, detail=detail, user=user, created_at=datetime.datetime.utcnow()))
+        session.commit()
+
+
+def get_user_by_username(username: str):
+    with get_session() as session:
+        return session.query(User).filter(User.username == username).first()
+
+
+def create_user(username: str, password: str, role: str = "operator"):
+    with get_session() as session:
+        hashed = get_password_hash(password)
+        user = User(username=username, hashed_password=hashed, role=role)
+        session.add(user)
+        session.commit()
+        return user
 
 
 def upsert_contact(identifier: str, channel: str, name: str = "") -> int:
-    now = datetime.datetime.utcnow().isoformat()
-    conn = get_conn()
-    row = conn.execute("SELECT id FROM contacts WHERE identifier=?", (identifier,)).fetchone()
-    if row:
-        conn.execute(
-            "UPDATE contacts SET last_seen=?, total_msgs=total_msgs+1 WHERE id=?",
-            (now, row["id"])
+    now = datetime.datetime.utcnow()
+    with get_session() as session:
+        contact = session.query(Contact).filter(Contact.identifier == identifier).first()
+        if contact:
+            contact.last_seen = now
+            contact.total_msgs += 1
+            session.commit()
+            return contact.id
+
+        contact = Contact(
+            identifier=identifier,
+            name=name,
+            channel=channel,
+            first_seen=now,
+            last_seen=now,
+            total_msgs=1,
         )
-        conn.commit()
-        cid = row["id"]
-    else:
-        cur = conn.execute(
-            "INSERT INTO contacts (identifier, name, channel, first_seen, last_seen, total_msgs) VALUES (?,?,?,?,?,1)",
-            (identifier, name, channel, now, now)
-        )
-        conn.commit()
-        cid = cur.lastrowid
-    conn.close()
-    return cid
+        session.add(contact)
+        session.commit()
+        return contact.id
 
 
 def save_inbound_message(contact_id: int, subject: str, body: str, ai_draft: str) -> int:
-    now = datetime.datetime.utcnow().isoformat()
-    conn = get_conn()
-
-    # Find or create open conversation
-    conv = conn.execute(
-        "SELECT id FROM conversations WHERE contact_id=? AND status='open' ORDER BY id DESC LIMIT 1",
-        (contact_id,)
-    ).fetchone()
-
-    if conv:
-        conv_id = conv["id"]
-        conn.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now, conv_id))
-    else:
-        cur = conn.execute(
-            "INSERT INTO conversations (contact_id, subject, status, created_at, updated_at) VALUES (?,?,?,?,?)",
-            (contact_id, subject, "open", now, now)
+    now = datetime.datetime.utcnow()
+    with get_session() as session:
+        conv = (
+            session.query(Conversation)
+            .filter(Conversation.contact_id == contact_id, Conversation.status == "open")
+            .order_by(Conversation.id.desc())
+            .first()
         )
-        conv_id = cur.lastrowid
-
-    cur = conn.execute(
-        "INSERT INTO messages (conversation_id, direction, body, ai_draft, status, created_at) VALUES (?,?,?,?,?,?)",
-        (conv_id, "inbound", body, ai_draft, "pending", now)
-    )
-    conn.commit()
-    msg_id = cur.lastrowid
-    conn.close()
-    return msg_id
+        if conv:
+            conv.updated_at = now
+            conv.subject = subject or conv.subject
+        else:
+            conv = Conversation(
+                contact_id=contact_id,
+                subject=subject,
+                status="open",
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(conv)
+            session.flush()
+        message = Message(
+            conversation_id=conv.id,
+            direction="inbound",
+            body=body,
+            ai_draft=ai_draft,
+            status="pending",
+            created_at=now,
+        )
+        session.add(message)
+        session.commit()
+        invalidate_stats_cache()
+        return message.id
 
 
 def mark_message_sent(msg_id: int, auto: bool = False):
     status = "auto_sent" if auto else "sent"
-    conn = get_conn()
-    conn.execute("UPDATE messages SET status=? WHERE id=?", (status, msg_id))
-    conn.commit()
-    conn.close()
+    with get_session() as session:
+        message = session.query(Message).filter(Message.id == msg_id).first()
+        if message:
+            message.status = status
+            session.commit()
+            invalidate_stats_cache()
+
+
+def update_ai_draft(msg_id: int, draft: str):
+    with get_session() as session:
+        message = session.query(Message).filter(Message.id == msg_id).first()
+        if message:
+            message.ai_draft = draft
+            session.commit()
+            invalidate_stats_cache()
 
 
 def get_pending_messages():
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT m.id, m.body, m.ai_draft, m.created_at,
-               c.identifier, c.name, c.channel,
-               conv.subject, conv.id as conv_id
-        FROM messages m
-        JOIN conversations conv ON m.conversation_id = conv.id
-        JOIN contacts c ON conv.contact_id = c.id
-        WHERE m.status = 'pending'
-        ORDER BY m.created_at DESC
-    """).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    if redis_client:
+        cached = redis_client.get("javis:pending")
+        if cached:
+            return json.loads(cached)
+    with get_session() as session:
+        rows = (
+            session.query(Message, Conversation, Contact)
+            .join(Conversation, Message.conversation_id == Conversation.id)
+            .join(Contact, Conversation.contact_id == Contact.id)
+            .filter(Message.status == "pending")
+            .order_by(Message.created_at.desc())
+            .all()
+        )
+        results = [
+            {
+                "id": msg.id,
+                "body": msg.body,
+                "ai_draft": msg.ai_draft,
+                "created_at": msg.created_at.isoformat(),
+                "identifier": contact.identifier,
+                "name": contact.name,
+                "channel": contact.channel,
+                "subject": conv.subject,
+                "conv_id": conv.id,
+            }
+            for msg, conv, contact in rows
+        ]
+        if redis_client:
+            redis_client.set("javis:pending", json.dumps(results), ex=10)
+        return results
 
 
 def get_all_conversations(limit: int = 50):
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT conv.id, conv.subject, conv.status, conv.updated_at,
-               c.identifier, c.name, c.channel,
-               COUNT(m.id) as msg_count
-        FROM conversations conv
-        JOIN contacts c ON conv.contact_id = c.id
-        LEFT JOIN messages m ON m.conversation_id = conv.id
-        GROUP BY conv.id
-        ORDER BY conv.updated_at DESC
-        LIMIT ?
-    """, (limit,)).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    with get_session() as session:
+        rows = (
+            session.query(
+                Conversation.id,
+                Conversation.subject,
+                Conversation.status,
+                Conversation.updated_at,
+                Contact.identifier,
+                Contact.name,
+                Contact.channel,
+                func.count(Message.id).label("msg_count"),
+            )
+            .join(Contact, Conversation.contact_id == Contact.id)
+            .outerjoin(Message, Message.conversation_id == Conversation.id)
+            .group_by(Conversation.id)
+            .order_by(Conversation.updated_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "id": row.id,
+                "subject": row.subject,
+                "status": row.status,
+                "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+                "identifier": row.identifier,
+                "name": row.name,
+                "channel": row.channel,
+                "msg_count": row.msg_count,
+            }
+            for row in rows
+        ]
 
 
 def get_stats():
-    conn = get_conn()
-    today = datetime.datetime.utcnow().date().isoformat()
-    stats = {
-        "total_messages"   : conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
-        "pending_approval" : conn.execute("SELECT COUNT(*) FROM messages WHERE status='pending'").fetchone()[0],
-        "sent_today"       : conn.execute("SELECT COUNT(*) FROM messages WHERE (status='sent' OR status='auto_sent') AND created_at LIKE ?", (today+"%",)).fetchone()[0],
-        "open_conversations": conn.execute("SELECT COUNT(*) FROM conversations WHERE status='open'").fetchone()[0],
-        "total_contacts"   : conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0],
-    }
-    conn.close()
-    return stats
+    if redis_client:
+        cached = redis_client.get("javis:stats")
+        if cached:
+            return json.loads(cached)
+    with get_session() as session:
+        today = datetime.datetime.utcnow().date()
+        stats = {
+            "total_messages": session.query(func.count(Message.id)).scalar() or 0,
+            "pending_approval": session.query(func.count(Message.id)).filter(Message.status == "pending").scalar() or 0,
+            "sent_today": session.query(func.count(Message.id)).filter(
+                Message.status.in_(["sent", "auto_sent"]),
+                func.date(Message.created_at) == today,
+            ).scalar() or 0,
+            "open_conversations": session.query(func.count(Conversation.id)).filter(Conversation.status == "open").scalar() or 0,
+            "total_contacts": session.query(func.count(Contact.id)).scalar() or 0,
+        }
+        if redis_client:
+            redis_client.set("javis:stats", json.dumps(stats), ex=15)
+        return stats
+
+
+def invalidate_stats_cache():
+    if redis_client:
+        redis_client.delete("javis:stats")
+        redis_client.delete("javis:pending")

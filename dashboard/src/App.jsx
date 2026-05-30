@@ -6,6 +6,7 @@ import ConversationFeed from './components/ConversationFeed';
 import MessageCard from './components/MessageCard';
 import DraftApproval from './components/DraftApproval';
 import Compose from './components/Compose';
+import LoginPage from './Login';
 import { api } from './api';
 
 // ── Toast system ─────────────────────────────────────────────
@@ -159,6 +160,8 @@ function ContactsPage({ conversations, loading }) {
 
 // ── Root App ──────────────────────────────────────────────────
 export default function App() {
+  const [isLoggedIn,     setIsLoggedIn]     = useState(!!localStorage.getItem('javis_token'));
+  const [loginLoading,   setLoginLoading]   = useState(false);
   const [activeTab,      setActiveTab]      = useState('dashboard');
   const [stats,          setStats]          = useState(null);
   const [conversations,  setConversations]  = useState([]);
@@ -174,7 +177,33 @@ export default function App() {
     setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 4000);
   }
 
+  async function handleLogin(username, password) {
+    setLoginLoading(true);
+    try {
+      const response = await api.login(username, password);
+      api.setToken(response.access_token);
+      setIsLoggedIn(true);
+      showToast(`Welcome, ${username}!`, 'success');
+    } catch (error) {
+      showToast('Login failed. Check your credentials.', 'error');
+      throw error;
+    } finally {
+      setLoginLoading(false);
+    }
+  }
+
+  function handleLogout() {
+    api.setToken(null);
+    setIsLoggedIn(false);
+    setStats(null);
+    setConversations([]);
+    setPending([]);
+    showToast('Logged out', 'info');
+  }
+
   const fetchAll = useCallback(async () => {
+    if (!isLoggedIn) return;
+    
     try {
       setLoadingStats(true);
       const s = await api.getStats();
@@ -193,18 +222,30 @@ export default function App() {
       const p = await api.getPending();
       setPending(p);
     } catch {} finally { setLoadingPending(false); }
-  }, []);
+  }, [isLoggedIn]);
 
   // Initial load + auto-refresh every 30s
   useEffect(() => {
-    fetchAll();
-    const interval = setInterval(fetchAll, 30000);
-    return () => clearInterval(interval);
-  }, [fetchAll]);
+    if (isLoggedIn) {
+      fetchAll();
+      const interval = setInterval(fetchAll, 30000);
+      return () => clearInterval(interval);
+    }
+  }, [isLoggedIn, fetchAll]);
+
+  // ── Render login page if not authenticated ─────────────────
+  if (!isLoggedIn) {
+    return (
+      <div className="app-layout">
+        <LoginPage onLogin={handleLogin} loading={loginLoading} showToast={showToast} />
+        <ToastContainer toasts={toasts} />
+      </div>
+    );
+  }
 
   return (
     <div className="app-layout">
-      <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} pendingCount={pending.length} />
+      <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} pendingCount={pending.length} onLogout={handleLogout} />
 
       <main className="main-content">
         {activeTab === 'dashboard' && (

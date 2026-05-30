@@ -1,5 +1,5 @@
 // J.A.V.I.S. Sidebar Navigation
-export default function Sidebar({ activeTab, setActiveTab, pendingCount }) {
+export default function Sidebar({ activeTab, setActiveTab, pendingCount, onLogout }) {
   const navItems = [
     { id: 'dashboard', icon: '⚡', label: 'Dashboard' },
     { id: 'pending',   icon: '📬', label: 'Pending Approval', badge: pendingCount },
@@ -38,6 +38,11 @@ export default function Sidebar({ activeTab, setActiveTab, pendingCount }) {
           <div className="status-dot" />
           Agent Online
         </div>
+        {onLogout && (
+          <button onClick={onLogout} className="nav-item" style={{ marginTop: 16, justifyContent: 'center' }}>
+            🚪 Sign Out
+          </button>
+        )}
       </div>
     </aside>
   );
