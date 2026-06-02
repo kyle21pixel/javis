@@ -82,6 +82,33 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
+class DraftVersion(Base):
+    """Audit trail for AI draft changes — allows rollback and history viewing"""
+    __tablename__ = "draft_versions"
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id"), nullable=False, index=True)
+    version_number = Column(Integer, nullable=False)
+    draft_text = Column(Text, nullable=False)
+    reason = Column(String, default="")  # "redraft", "edit", "ai_revision"
+    created_by = Column(String, default="")  # username
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class MessageAnalytics(Base):
+    """Message-level metrics for reporting and analytics"""
+    __tablename__ = "message_analytics"
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id"), nullable=False, index=True)
+    channel = Column(String, nullable=False)  # "email" or "sms"
+    ai_draft_generated_at = Column(DateTime)
+    approved_at = Column(DateTime)
+    sent_at = Column(DateTime)
+    approval_time_seconds = Column(Integer)  # time between draft and approval
+    total_time_seconds = Column(Integer)  # inbound → sent
+    auto_sent = Column(Integer, default=0)  # 1 if auto-sent, 0 if manual
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
 def init_db():
     Base.metadata.create_all(bind=_engine)
     with SessionLocal() as session:
@@ -293,3 +320,131 @@ def invalidate_stats_cache():
     if redis_client:
         redis_client.delete("javis:stats")
         redis_client.delete("javis:pending")
+
+
+# ── Draft Versioning ──────────────────────────────────────────────────────────
+
+def save_draft_version(msg_id: int, draft_text: str, reason: str = "", created_by: str = "") -> int:
+    """Save a new draft version"""
+    with get_session() as session:
+        # Get current highest version number
+        max_version = session.query(func.max(DraftVersion.version_number)).filter(
+            DraftVersion.message_id == msg_id
+        ).scalar() or 0
+        
+        version = DraftVersion(
+            message_id=msg_id,
+            version_number=max_version + 1,
+            draft_text=draft_text,
+            reason=reason,
+            created_by=created_by,
+        )
+        session.add(version)
+        session.commit()
+        return version.id
+
+
+def get_draft_history(msg_id: int):
+    """Get all versions of a draft"""
+    with get_session() as session:
+        versions = session.query(DraftVersion).filter(
+            DraftVersion.message_id == msg_id
+        ).order_by(DraftVersion.version_number.desc()).all()
+        return [
+            {
+                "version": v.version_number,
+                "text": v.draft_text,
+                "reason": v.reason,
+                "created_by": v.created_by,
+                "created_at": v.created_at.isoformat(),
+            }
+            for v in versions
+        ]
+
+
+# ── Message Analytics ────────────────────────────────────────────────────────
+
+def create_message_analytics(msg_id: int, channel: str):
+    """Create analytics record when message arrives"""
+    with get_session() as session:
+        analytics = MessageAnalytics(
+            message_id=msg_id,
+            channel=channel,
+            ai_draft_generated_at=datetime.datetime.utcnow(),
+        )
+        session.add(analytics)
+        session.commit()
+
+
+def record_approval(msg_id: int):
+    """Record when user approves a message"""
+    with get_session() as session:
+        analytics = session.query(MessageAnalytics).filter(
+            MessageAnalytics.message_id == msg_id
+        ).first()
+        if analytics:
+            analytics.approved_at = datetime.datetime.utcnow()
+            if analytics.ai_draft_generated_at:
+                delta = analytics.approved_at - analytics.ai_draft_generated_at
+                analytics.approval_time_seconds = int(delta.total_seconds())
+            session.commit()
+
+
+def record_sent(msg_id: int, auto: bool = False):
+    """Record when message is sent"""
+    with get_session() as session:
+        analytics = session.query(MessageAnalytics).filter(
+            MessageAnalytics.message_id == msg_id
+        ).first()
+        if analytics:
+            analytics.sent_at = datetime.datetime.utcnow()
+            analytics.auto_sent = 1 if auto else 0
+            if analytics.ai_draft_generated_at:
+                delta = analytics.sent_at - analytics.ai_draft_generated_at
+                analytics.total_time_seconds = int(delta.total_seconds())
+            session.commit()
+
+
+def get_analytics_summary(days: int = 7):
+    """Get analytics for last N days"""
+    with get_session() as session:
+        since = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+        analytics = session.query(MessageAnalytics).filter(
+            MessageAnalytics.created_at >= since
+        ).all()
+        
+        if not analytics:
+            return {
+                "period_days": days,
+                "total_messages": 0,
+                "auto_sent_count": 0,
+                "manual_sent_count": 0,
+                "avg_approval_time_seconds": 0,
+                "avg_total_time_seconds": 0,
+                "by_channel": {},
+            }
+        
+        total = len(analytics)
+        auto_count = sum(1 for a in analytics if a.auto_sent)
+        manual_count = sum(1 for a in analytics if not a.auto_sent)
+        
+        approval_times = [a.approval_time_seconds for a in analytics if a.approval_time_seconds]
+        total_times = [a.total_time_seconds for a in analytics if a.total_time_seconds]
+        
+        by_channel = {}
+        for channel in ["email", "sms"]:
+            channel_analytics = [a for a in analytics if a.channel == channel]
+            by_channel[channel] = {
+                "count": len(channel_analytics),
+                "auto_sent": sum(1 for a in channel_analytics if a.auto_sent),
+            }
+        
+        return {
+            "period_days": days,
+            "total_messages": total,
+            "auto_sent_count": auto_count,
+            "manual_sent_count": manual_count,
+            "avg_approval_time_seconds": int(sum(approval_times) / len(approval_times)) if approval_times else 0,
+            "avg_total_time_seconds": int(sum(total_times) / len(total_times)) if total_times else 0,
+            "by_channel": by_channel,
+        }

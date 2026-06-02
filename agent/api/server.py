@@ -3,12 +3,16 @@ J.A.V.I.S. FastAPI Server — REST API for the React dashboard
 """
 import sys
 import os
+import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 from fastapi import FastAPI, HTTPException, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel
+import traceback
 
 import database
 from channels.email_handler import send_email
@@ -16,6 +20,9 @@ from channels.sms_handler import handle_inbound_sms, send_sms
 from ai.brain import draft_reply
 from security import authenticate_user, create_access_token, get_current_user
 from rate_limiter import RateLimiter
+from health import health_status
+from errors import AuthenticationError, AuthorizationError, NotFoundError, ValidationError, RateLimitError, ExternalServiceError
+from logging_config import logger
 
 app = FastAPI(
     title="J.A.V.I.S. Business Assistant API",
@@ -24,6 +31,16 @@ app = FastAPI(
 )
 
 limiter = RateLimiter()
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database on startup"""
+    try:
+        database.init_db()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}", exc_info=True)
 
 # Allow React dev server
 app.add_middleware(
@@ -39,8 +56,46 @@ app.add_middleware(
 async def rate_limit_middleware(request: Request, call_next):
     client_ip = request.client.host if request.client else "unknown"
     if not limiter.is_allowed(client_ip):
+        logger.warning(f"Rate limit exceeded for {client_ip}")
         raise HTTPException(status_code=429, detail="Too many requests")
     return await call_next(request)
+
+
+@app.middleware("http")
+async def error_handling_middleware(request: Request, call_next):
+    """Catch and log all exceptions"""
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
+        # Convert custom exceptions to HTTP exceptions
+        if isinstance(exc, AuthenticationError):
+            raise exc.to_http_exception()
+        if isinstance(exc, AuthorizationError):
+            raise exc.to_http_exception()
+        if isinstance(exc, NotFoundError):
+            raise exc.to_http_exception()
+        if isinstance(exc, ValidationError):
+            raise exc.to_http_exception()
+        if isinstance(exc, RateLimitError):
+            raise exc.to_http_exception()
+        if isinstance(exc, ExternalServiceError):
+            raise exc.to_http_exception()
+        # Generic error response
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error",
+        )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Log HTTP exceptions"""
+    logger.warning(f"HTTP {exc.status_code}: {exc.detail}", extra={"path": request.url.path})
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
 
 
 # ── Request Models ────────────────────────────────────────────────────────────
@@ -66,10 +121,46 @@ class SendSMSRequest(BaseModel):
     body: str
 
 
+# ── Health & Diagnostics ──────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health_probe():
+    """Kubernetes/Docker liveness probe"""
+    await health_status.refresh()
+    if health_status.is_healthy:
+        return {"status": "ok", "details": health_status.to_dict()}
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"status": "error", "details": health_status.to_dict()},
+    )
+
+
+@app.get("/readiness")
+async def readiness_probe():
+    """Kubernetes/Docker readiness probe"""
+    await health_status.refresh()
+    if health_status.is_ready:
+        return {"ready": True, "timestamp": datetime.datetime.utcnow().isoformat()}
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"ready": False, "reason": "Dependencies unavailable"},
+    )
+
+
+@app.get("/version")
+def version_info():
+    """API version and build info"""
+    return {
+        "version": "2.0.0",
+        "service": "J.A.V.I.S. Business Assistant",
+        "environment": os.getenv("ENV", "development"),
+    }
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/")
-def health():
+def root():
     return {"status": "running", "service": "J.A.V.I.S. Business Assistant"}
 
 
@@ -77,6 +168,7 @@ def health():
 def login(credentials: AuthRequest):
     user = authenticate_user(credentials.username, credentials.password)
     if not user:
+        logger.warning(f"Login failed for user {credentials.username}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
@@ -84,6 +176,7 @@ def login(credentials: AuthRequest):
         )
     access_token = create_access_token({"sub": user.username})
     database.log_event("login", f"User {user.username} logged in", user.username)
+    logger.info(f"User {user.username} logged in")
     return {"access_token": access_token, "token_type": "bearer"}
 
 
@@ -205,3 +298,24 @@ def redraft_message(msg_id: int, current_user=Depends(get_current_user)):
     database.update_ai_draft(msg_id, new_draft)
     database.log_event("redraft", f"User {current_user.username} redrafted msg {msg_id}", current_user.username)
     return {"draft": new_draft}
+
+
+# ── Analytics & Reporting ───────────────────────────────────────────────────────
+
+@app.get("/api/analytics/summary")
+def analytics_summary(days: int = 7, current_user=Depends(get_current_user)):
+    """Get performance metrics for the last N days (admin only)"""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    database.log_event("analytics_view", f"User {current_user.username} viewed analytics", current_user.username)
+    return database.get_analytics_summary(days)
+
+
+@app.get("/api/analytics/draft-history/{msg_id}")
+def draft_history(msg_id: int, current_user=Depends(get_current_user)):
+    """Get draft version history for a message"""
+    history = database.get_draft_history(msg_id)
+    if not history:
+        raise HTTPException(status_code=404, detail="Message not found or no draft history")
+    database.log_event("draft_history_view", f"User {current_user.username} viewed draft history for msg {msg_id}", current_user.username)
+    return {"msg_id": msg_id, "versions": history}
